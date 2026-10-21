@@ -36,6 +36,8 @@ function harness({ replies = [PASS], config = {}, messages = defaultMessages(), 
       handlers.set(event, handler);
       return () => {};
     },
+    // 测试里没有 webServer：直接跳过可选的配置 API 注册
+    inject() {},
     logger: {
       info: (...args) => logs.push(['info', ...args]),
       warn: (...args) => logs.push(['warn', ...args]),

@@ -17,7 +17,9 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
@@ -159,6 +161,80 @@ function normalizeConfig(config) {
 
 /** 纯寒暄 / 纯确认：不值得为它调用审判模型。 */
 const TRIVIAL_ANSWER = /^(好的|收到|已完成|完成了|已处理|已发送|已更新|没问题|OK|Okay|Done|Sure)[。.!！,，\s]*$/i;
+
+/* ---------------- 可编辑配置（插件页表单写入这里） ---------------- */
+
+const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
+const CONFIG_FILE = path.join(PLUGIN_DIR, 'config.json');
+
+/** 表单允许改写的顶层字段 */
+const EDITABLE_FIELDS = {
+  enabled: 'bool',
+  dryRun: 'bool',
+  maxAttempts: 'int',
+  sessionRejectBudget: 'int',
+  minAnswerChars: 'int',
+  judgeProvider: 'str',
+  judgeModel: 'str',
+  judgeMaxTokens: 'int',
+  transcriptChars: 'int',
+  toolResultChars: 'int',
+  submitTool: 'bool',
+  skipTrivial: 'bool',
+};
+/** 表单允许改写的 jev.* 字段 */
+const EDITABLE_JEV = {
+  enabled: 'bool',
+  model: 'str',
+  proxyUrl: 'str',
+  riskThreshold: 'num',
+  onError: 'str',
+  timeoutMs: 'int',
+  stateChars: 'int',
+};
+
+function readOverrides() {
+  try {
+    const raw = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeOverrides(next) {
+  writeFileSync(CONFIG_FILE, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+}
+
+function coerce(kind, value) {
+  if (kind === 'bool') return value === true || value === 'true' || value === 1;
+  if (kind === 'int' || kind === 'num') {
+    const n = Number(value);
+    return Number.isFinite(n) ? (kind === 'int' ? Math.trunc(n) : n) : undefined;
+  }
+  return value === undefined || value === null ? '' : String(value);
+}
+
+/** 只接受已知字段，避免表单/接口写入任意配置。 */
+function sanitizeOverrides(input) {
+  const out = {};
+  if (!input || typeof input !== 'object') return out;
+  for (const [key, kind] of Object.entries(EDITABLE_FIELDS)) {
+    if (!Object.hasOwn(input, key)) continue;
+    const value = coerce(kind, input[key]);
+    if (value !== undefined) out[key] = value;
+  }
+  const jev = input.jev;
+  if (jev && typeof jev === 'object' && !Array.isArray(jev)) {
+    out.jev = {};
+    for (const [key, kind] of Object.entries(EDITABLE_JEV)) {
+      if (!Object.hasOwn(jev, key)) continue;
+      const value = coerce(kind, jev[key]);
+      if (value !== undefined) out.jev[key] = value;
+    }
+  }
+  return out;
+}
 
 /** 从一个内容块数组里取出纯文本。 */
 function blocksToText(blocks) {
@@ -513,11 +589,16 @@ function judgeUserText(transcript, draft, cfg) {
 /* ------------------------------------------------------------------ */
 
 export function apply(ctx, config) {
-  const cfg = normalizeConfig(config);
-  if (!cfg.enabled) {
-    ctx.logger?.info?.('dsh-judge: disabled by config');
-    return;
-  }
+  const baseConfig = config && typeof config === 'object' ? config : {};
+  let overrides = readOverrides();
+  const merged = () => {
+    const stored = overrides ?? {};
+    const baseJev = baseConfig.jev && typeof baseConfig.jev === 'object' ? baseConfig.jev : {};
+    const storedJev = stored.jev && typeof stored.jev === 'object' ? stored.jev : {};
+    return { ...baseConfig, ...stored, jev: { ...baseJev, ...storedJev } };
+  };
+  let cfg = normalizeConfig(merged());
+  if (!cfg.enabled) ctx.logger?.info?.('dsh-judge: disabled (can be enabled from the plugin page)');
 
   /** `${sessionId}:${turn}` -> 已驳回次数 */
   const attempts = new Map();
@@ -645,6 +726,7 @@ export function apply(ctx, config) {
       const turn = payload?.turn;
       const signal = payload?.signal;
       if (!agent?.session) return;
+      if (!cfg.enabled) return;
       const header = agent.session.header ?? {};
       if (cfg.skipSubagents && (header.origin === 'subagent' || header.parentSession !== undefined)) return;
 
@@ -776,6 +858,7 @@ export function apply(ctx, config) {
             : [{ type: 'text', text: `审判员未通过：\n${value.report}\n\n按上面的要求补齐证据或降级表述后，再次调用 judge_review，通过后再输出最终答案。` }],
       },
       async execute(args, exec) {
+        if (!cfg.enabled) return { approved: false, report: '审判员当前已关闭（可在插件页重新启用）。' };
         const agent = exec?.agent;
         if (!agent?.session) return { approved: false, report: '没有可用的 agent 会话上下文，无法复核。' };
         const result = await review(agent, 'submit', exec?.signal, args?.answer);
@@ -810,10 +893,68 @@ export function apply(ctx, config) {
     }),
   );
 
+  /* ---------------- 4) 插件页配置接口（浏览器半读写它） ---------------- */
+  const sendJson = (res, code, obj) => {
+    const data = Buffer.from(JSON.stringify(obj), 'utf8');
+    res.writeHead(code, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': data.length,
+      'Cache-Control': 'no-store',
+    });
+    res.end(data);
+  };
+  const readBody = (req) =>
+    new Promise((resolve, reject) => {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'));
+        } catch (error) {
+          reject(error);
+        }
+      });
+      req.on('error', reject);
+    });
+  const publicConfig = () => ({ ...cfg, jev: { ...cfg.jev } });
+
+  async function handleApi(req, res) {
+    const url = new URL(req.url, 'http://localhost');
+    try {
+      if (req.method === 'GET' && url.pathname === '/dsh-judge/api/config') {
+        return sendJson(res, 200, { ok: true, config: publicConfig(), configFile: CONFIG_FILE });
+      }
+      if (req.method === 'POST' && url.pathname === '/dsh-judge/api/config') {
+        const body = await readBody(req);
+        const next = sanitizeOverrides(body?.config ?? body);
+        overrides = {
+          ...overrides,
+          ...next,
+          jev: { ...(overrides.jev ?? {}), ...(next.jev ?? {}) },
+        };
+        writeOverrides(overrides);
+        cfg = normalizeConfig(merged());
+        log('info', 'config updated from plugin page', { enabled: cfg.enabled, jevEnabled: cfg.jev.enabled });
+        return sendJson(res, 200, { ok: true, config: publicConfig(), configFile: CONFIG_FILE });
+      }
+      return sendJson(res, 404, { ok: false, message: 'not found' });
+    } catch (error) {
+      return sendJson(res, 500, { ok: false, message: String(error?.message ?? error) });
+    }
+  }
+
+  ctx.inject(['webServer'], (child) => {
+    child.effect(
+      () => child.webServer.register({ kind: 'prefix', path: '/dsh-judge', handler: handleApi }),
+      'dsh-judge: config api',
+    );
+  });
+
   log('info', 'ready', {
     dryRun: cfg.dryRun,
     maxAttempts: cfg.maxAttempts,
     submitTool: cfg.submitTool,
     sessionRejectBudget: cfg.sessionRejectBudget,
+    jevEnabled: cfg.jev.enabled,
   });
 }

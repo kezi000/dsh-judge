@@ -161,6 +161,16 @@ Jev 不给驳回文案，所以它不能单独承担"驳回并说明原因"，�
 所以启用前要先准备：`TYPESAFE_API_KEY`（或 `apiKeyFile` 指向的 key 文件）+ 一个能出海的本地代理。
 阈值 0.5 只是起点（Noul 0.5 = 是非各半），请用一批真实答案 + 标签跑 sweep 再定。
 
+### 6.2 插件页配置表单（v0.2.0）
+
+浏览器半（`client.js`）通过 `plugins.bundle.config` slot 注册在「插件 → dsh-judge」详情页里，
+渲染总开关 / 驳回预算 / 审判模型 / Jev 四组字段；保存走同源接口
+`GET|POST /dsh-judge/api/config`（由 `index.js` 用 `ctx.webServer` 注册）。
+
+- 保存写入插件目录的 `config.json`，它覆盖 bundle 里的默认值；无需重启即可生效（节点半是同一进程）；
+- 想回到默认值，删掉 `config.json` 再重启；
+- 客户端半随宿主启动加载，首次安装/更新后需要重启一次才能在页面看到表单。
+
 ## 7. 验证
 
 ```bat
