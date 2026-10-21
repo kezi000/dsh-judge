@@ -482,9 +482,19 @@ async function callJudge(ctx, route, userText, signal, cfg, budget = cfg.judgeMa
   if (!text.trim() && budget < 12000) {
     return callJudge(ctx, route, userText, signal, cfg, Math.min(12000, budget * 2));
   }
-  const parsed = extractJson(text);
+  const parsed = extractJson(text) ?? verdictFallback(text);
   if (!parsed) throw new Error(`judge: could not parse verdict JSON: ${text.slice(0, 200)} (${diag})`);
   return normalizeVerdict(parsed);
+}
+
+/**
+ * 判定 JSON 被截断（长推理/长 issues）时的兜底：只捞 verdict 字段。
+ * 宁可给出"未通过但无细节"的通用驳回，也不要因为解析失败把整轮判成错误。
+ */
+function verdictFallback(text) {
+  const match = /"verdict"\s*:\s*"(pass|revise)"/.exec(String(text ?? ''));
+  if (!match) return null;
+  return { verdict: match[1], confidence: 0, issues: [], must_do: [] };
 }
 
 function judgeUserText(transcript, draft, cfg) {

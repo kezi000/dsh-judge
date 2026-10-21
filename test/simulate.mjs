@@ -311,6 +311,14 @@ test('JSON 解析：容忍代码围栏与前后废话', async () => {
   assert.equal(h.steers.length, 0);
 });
 
+test('判定 JSON 被截断：仍能捞到 verdict 并驳回', async () => {
+  const truncated = '{"verdict":"revise","confidence":0.7,"issues":[{"claim":"版本号 9.9.9","kind":"unsupported","why":"工具结果里没有版本号';
+  const h = harness({ replies: [truncated] });
+  await h.stop(1);
+  assert.equal(h.steers.length, 1, 'truncated JSON should still reject');
+  assert.match(h.steers[0].content[0].text, /未通过/);
+});
+
 test('传给审判员的输入包含工具证据与草稿', async () => {
   let seen = '';
   const h = harness({
