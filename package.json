@@ -22,6 +22,10 @@
     "fact-checking"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kezi000/dsh-judge.git"
+  },
   "engines": {
     "node": ">=20"
   },

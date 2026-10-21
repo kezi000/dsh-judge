@@ -62,40 +62,40 @@ settlement 时已提交到 surface），插件**无法撤回**已经流出的文
 
 ## 4. 安装
 
-插件目录：`C:\Users\XY\.dsh\plugins\dsh-judge`
+本仓库内容即插件（`index.js` + `package.json` + `cordis.patch.yml`）。安装方式二选一：
 
-1. **放进插件目录**（本仓库内容即插件）：
+### 方式 A：作为 profile 组合包（推荐，会出现在侧边栏「插件」页）
 
-   ```bat
-   xcopy /E /I F:\data\test\dsh-judge C:\Users\XY\.dsh\plugins\dsh-judge
-   ```
-
-2. **让 profile 能解析到包名**（二选一）：
+1. 复制到插件目录：
 
    ```bat
-   :: A. 直接建 junction（立刻生效）
-   mklink /J C:\Users\XY\.dsh\profiles\desktop\node_modules\dsh-judge C:\Users\XY\.dsh\plugins\dsh-judge
-   ```
-   或在 profile 的 `package.json` 依赖里加
-   `"dsh-judge": "file:C:/Users/XY/.dsh/plugins/dsh-judge"` 后 `pnpm install`。
-
-3. **挂载**：在 `C:\Users\XY\.dsh\profiles\desktop\cordis.patch.yml` 追加
-
-   ```yaml
-   - id: dsh-judge
-     name: dsh-judge
-     config:
-       enabled: true
-       dryRun: true      # 先观察，确认判定合理后改成 false
-       maxAttempts: 2
-       submitTool: true
+   xcopy /E /I <本仓库目录> %USERPROFILE%\.dsh\plugins\dsh-judge
    ```
 
-   profile 是 `"patchReload": "live"`，保存即热加载，无需重启。
+2. 在 `%USERPROFILE%\.dsh\profiles\desktop\package.json` 里：
 
-4. **观察**：先跑几天 `dryRun: true`，日志里会出现
-   `dsh-judge: DRY RUN: would reject answer`（含 issues / must_do / 草稿片段）。
-   确认误判率可接受后改 `dryRun: false`。
+   - `dependencies` 增加 `"dsh-judge": "file:<你的用户目录>/.dsh/plugins/dsh-judge"`
+   - `dsh.profile.bundles` 增加 `"dsh-judge"`
+
+3. 让 Node 能解析到包名（任选其一）：在 `<profile>\node_modules` 下建 junction
+   `mklink /J node_modules\dsh-judge %USERPROFILE%\.dsh\plugins\dsh-judge`，
+   或在 profile 目录跑 `pnpm install`。
+
+4. 重启 DSH。组合包列表在启动期组合，重启后才会以组合包形态加载并显示在插件页。
+
+### 方式 B：home patch 手动挂载（立刻生效，但不出现在插件页）
+
+把本仓库 `cordis.patch.yml` 里的 `- insert:` 段整段抄进
+`%USERPROFILE%\.dsh\cordis.patch.yml`，保存即热加载。注意 `name` 要么写成包名
+`dsh-judge`（需先让 profile 能解析到），要么写成
+`"file:///C:/Users/<你的用户名>/.dsh/plugins/dsh-judge/index.js"`。
+
+> 两种方式不要同时用：同一个 `id` 挂两次属于未定义行为，建议只保留一种。
+
+### 首次运行建议
+
+先设 `dryRun: true` 跑几天：只记录「本应驳回」的判定（含 issues / must_do / 草稿片段），
+不真正打断回答。确认误判率可接受后再改成 `dryRun: false`。
 
 ## 5. 配置
 
