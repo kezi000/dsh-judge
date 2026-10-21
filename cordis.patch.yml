@@ -1,0 +1,26 @@
+# dsh-judge 作为 profile 组合包（bundle）时的挂载行。
+# 组合包 patch 的格式必须是 patch 操作列表：`- insert: [ { id, name, config } ]`
+# （与 dsh-infinite-gen-4 的 cordis.patch.yml 写法一致）。
+# 若只想用 home patch 手动挂载，把下面的 insert 段整段抄进
+# %USERPROFILE%\.dsh\cordis.patch.yml 即可。
+- insert:
+    - id: dsh-judge
+      name: dsh-judge
+      config:
+        enabled: true
+        # 首次部署建议 true：只记录“本应驳回”的判定，不真正打断回答。
+        dryRun: false
+        maxAttempts: 2
+        minAnswerChars: 40
+        onJudgeError: allow
+        skipSubagents: true
+        language: zh
+        # 留空 = 跟随当前会话的 provider/model；也可以指定更便宜/更强的审判模型。
+        judgeProvider: ''
+        judgeModel: ''
+        judgeMaxTokens: 6000
+        transcriptChars: 24000
+        toolResultChars: 1500
+        submitTool: true
+        promptOrder: 900
+        contract: ''

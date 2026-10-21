@@ -1,0 +1,38 @@
+{
+  "name": "dsh-judge",
+  "version": "0.1.0",
+  "description": "审判员插件：在 agent 结束一轮之前复核答案的事实性断言，未通过则驳回并要求补齐证据或降级表述。",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "reviewer",
+    "judge",
+    "fact-checking"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "id": "dsh-judge",
+    "name": "审判员",
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node test/simulate.mjs"
+  }
+}

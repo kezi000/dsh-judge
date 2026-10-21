@@ -1,0 +1,231 @@
+/**
+ * 离线自测：用假 ctx / 假 agent 驱动插件，验证闸门逻辑（不调用真实模型）。
+ * 运行：node test/simulate.mjs
+ */
+import assert from 'node:assert/strict';
+import { apply } from '../index.js';
+
+const PASS = JSON.stringify({ verdict: 'pass', confidence: 0.9 });
+const REVISE = JSON.stringify({
+  verdict: 'revise',
+  confidence: 0.8,
+  issues: [{ claim: '库版本是 0.2.1', kind: 'unsupported', why: '本会话没有读取过 package.json' }],
+  must_do: ['用 read 打开 package.json 核实版本号，或把版本号标注为未核实'],
+});
+
+const DRAFT = '这个库的版本是 0.2.1，配置项写在 cordis.yml 的 plugins 字段里，改完重启即可。';
+
+function stream(text, kind = 'stop') {
+  return (async function* () {
+    yield { type: 'text-delta', text };
+    yield { type: 'finish', reason: { kind } };
+  })();
+}
+
+function harness({ replies = [PASS], config = {}, messages = defaultMessages(), header = {} } = {}) {
+  const handlers = new Map();
+  const registered = [];
+  const logs = [];
+  let calls = 0;
+  const ctx = {
+    effect(fn) {
+      const disposable = fn();
+      return typeof disposable === 'function' ? disposable : () => {};
+    },
+    on(event, handler) {
+      handlers.set(event, handler);
+      return () => {};
+    },
+    logger: {
+      info: (...args) => logs.push(['info', ...args]),
+      warn: (...args) => logs.push(['warn', ...args]),
+    },
+    systemPrompt: { section: (spec) => (registered.push({ kind: 'section', spec }), () => {}) },
+    tools: { register: (def) => (registered.push({ kind: 'tool', def }), () => {}) },
+    llm: {
+      stream() {
+        const reply = replies[Math.min(calls, replies.length - 1)];
+        calls += 1;
+        if (reply instanceof Error) throw reply;
+        return typeof reply === 'function' ? reply() : stream(reply);
+      },
+    },
+  };
+  apply(ctx, config);
+
+  const steers = [];
+  const session = {
+    id: 'sess-1',
+    header,
+    deriveMessages: () => messages,
+    requestHeader: () => ({ config: { provider: 'p', model: 'm' } }),
+  };
+  const agent = { id: 'sess-1', session, options: { provider: 'p', model: 'm' }, steer: (m) => steers.push(m) };
+
+  return {
+    ctx,
+    registered,
+    logs,
+    steers,
+    agent,
+    calls: () => calls,
+    stop: (turn = 1) => handlers.get('agent/turn-stopping')({ agent, turn, signal: new AbortController().signal }),
+    tool: () => registered.find((r) => r.kind === 'tool')?.def,
+  };
+}
+
+function defaultMessages(draft = DRAFT) {
+  return [
+    { role: 'user', content: [{ type: 'text', text: '这个库怎么配置？' }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'read', arguments: '{"path":"cordis.yml"}' }] },
+    { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: '[]\n' }] },
+    { role: 'assistant', content: [{ type: 'text', text: draft }] },
+  ];
+}
+
+const tests = [];
+const test = (name, fn) => tests.push([name, fn]);
+
+test('revise → steer 一条驳回消息，且形状合法', async () => {
+  const h = harness({ replies: [REVISE] });
+  await h.stop(3);
+  assert.equal(h.steers.length, 1);
+  const msg = h.steers[0];
+  assert.equal(msg.role, 'user');
+  assert.ok(msg.id && msg.id.length > 10, 'message needs an id');
+  assert.equal(msg.source.kind, 'judge-reviewer');
+  const text = msg.content[0].text;
+  assert.match(text, /未通过/);
+  assert.match(text, /问题/);
+  assert.match(text, /必须完成/);
+});
+
+test('pass → 不打断轮次', async () => {
+  const h = harness({ replies: [PASS] });
+  await h.stop(1);
+  assert.equal(h.steers.length, 0);
+  assert.equal(h.calls(), 1);
+});
+
+test('dryRun → 只记录，不 steer', async () => {
+  const h = harness({ replies: [REVISE], config: { dryRun: true } });
+  await h.stop(1);
+  assert.equal(h.steers.length, 0);
+  assert.ok(h.logs.some((l) => String(l[1]).includes('DRY RUN')));
+});
+
+test('审判调用失败 + onJudgeError=allow → 放行', async () => {
+  const h = harness({
+    replies: [async function* () { yield { type: 'finish', reason: { kind: 'error', failure: { code: 'TRANSPORT', message: 'boom' } } }; }],
+  });
+  await h.stop(1);
+  assert.equal(h.steers.length, 0);
+  assert.ok(h.logs.some((l) => l[0] === 'warn'), 'should warn');
+});
+
+test('审判调用失败 + onJudgeError=revise → 驳回（受预算约束）', async () => {
+  const h = harness({
+    replies: [async function* () { yield { type: 'finish', reason: { kind: 'error', failure: { code: 'TRANSPORT', message: 'boom' } } }; }],
+    config: { onJudgeError: 'revise', maxAttempts: 1 },
+  });
+  await h.stop(1);
+  assert.equal(h.steers.length, 1);
+});
+
+test('maxAttempts 用尽后放行，不无限驳回', async () => {
+  const h = harness({ replies: [REVISE], config: { maxAttempts: 1 } });
+  await h.stop(7);
+  await h.stop(7);
+  await h.stop(7);
+  assert.equal(h.steers.length, 1);
+  assert.ok(h.logs.some((l) => String(l[1]).includes('budget exhausted')));
+});
+
+test('另一个 turn 重新计数', async () => {
+  const h = harness({ replies: [REVISE], config: { maxAttempts: 1 } });
+  await h.stop(1);
+  await h.stop(2);
+  assert.equal(h.steers.length, 2);
+});
+
+test('短答案不审', async () => {
+  const h = harness({ replies: [REVISE], messages: defaultMessages('好的。') });
+  await h.stop(1);
+  assert.equal(h.steers.length, 0);
+  assert.equal(h.calls(), 0);
+});
+
+test('子代理会话跳过', async () => {
+  const h = harness({ replies: [REVISE], header: { origin: 'subagent', parentSession: 'parent' } });
+  await h.stop(1);
+  assert.equal(h.steers.length, 0);
+  assert.equal(h.calls(), 0);
+});
+
+test('系统提示词段落已注册', async () => {
+  const h = harness({});
+  const section = h.registered.find((r) => r.kind === 'section');
+  assert.ok(section, 'section registered');
+  assert.equal(section.spec.name, 'dsh-judge:contract');
+  assert.match(section.spec.text, /审判员/);
+});
+
+test('judge_review 工具：通过后记录草稿，轮次收尾不再重复审判', async () => {
+  const h = harness({ replies: [PASS] });
+  const tool = h.tool();
+  assert.ok(tool, 'tool registered');
+  const result = await tool.execute({ answer: DRAFT }, { agent: h.agent, signal: new AbortController().signal });
+  assert.equal(result.approved, true);
+  const before = h.calls();
+  await h.stop(4);
+  assert.equal(h.calls(), before, 'no extra judge call for an approved draft');
+  assert.equal(h.steers.length, 0);
+});
+
+test('judge_review 工具：驳回时返回报告且不记录', async () => {
+  const h = harness({ replies: [REVISE] });
+  const tool = h.tool();
+  const result = await tool.execute({ answer: DRAFT }, { agent: h.agent, signal: new AbortController().signal });
+  assert.equal(result.approved, false);
+  assert.match(result.report, /unsupported/);
+  await h.stop(5);
+  assert.equal(h.steers.length, 1, 'gate still rejects the echoed draft');
+});
+
+test('JSON 解析：容忍代码围栏与前后废话', async () => {
+  const fenced = '复核结果如下：\n```json\n{"verdict":"pass"}\n```\n以上。';
+  const h = harness({ replies: [fenced] });
+  await h.stop(1);
+  assert.equal(h.steers.length, 0);
+});
+
+test('传给审判员的输入包含工具证据与草稿', async () => {
+  let seen = '';
+  const h = harness({
+    replies: [() => (async function* () { yield { type: 'text-delta', text: PASS }; yield { type: 'finish', reason: { kind: 'stop' } }; })()],
+  });
+  const original = h.ctx.llm.stream;
+  h.ctx.llm.stream = (options) => {
+    seen = options.messages[0].content[0].text;
+    return original.call(h.ctx.llm, options);
+  };
+  await h.stop(1);
+  assert.match(seen, /SESSION_TRANSCRIPT/);
+  assert.match(seen, /TOOL\(c1\)/);
+  assert.match(seen, /DRAFT_ANSWER/);
+  assert.match(seen, /这个库的版本是 0\.2\.1/);
+});
+
+let failed = 0;
+for (const [name, fn] of tests) {
+  try {
+    await fn();
+    console.log(`PASS  ${name}`);
+  } catch (error) {
+    failed += 1;
+    console.log(`FAIL  ${name}`);
+    console.log(`      ${error?.stack?.split('\n').slice(0, 4).join('\n      ')}`);
+  }
+}
+console.log(`\n${tests.length - failed}/${tests.length} passed`);
+process.exit(failed === 0 ? 0 : 1);
