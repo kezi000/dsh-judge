@@ -29,8 +29,8 @@ const DEFAULTS = {
   dryRun: false,
   /** 低于这个字符数的答案不审（寒暄、一句确认）。 */
   minAnswerChars: 40,
-  /** 同一轮最多驳回几次；到上限后放行并记录 warn，防止死循环。 */
-  maxAttempts: 2,
+  /** 同一轮最多驳回几次；到上限后放行并记录 warn，防止死循环。设为 0 等于只看不拦。 */
+  maxAttempts: 1,
   /** 审判调用失败时的策略：'allow' 放行（可用优先）/ 'revise' 驳回（正确优先）。 */
   onJudgeError: 'allow',
   /** 跳过子代理会话（子代理的答案会汇总到父代理，父代理那层还会再审）。 */
