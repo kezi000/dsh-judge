@@ -10,7 +10,10 @@
         enabled: true
         # 首次部署建议 true：只记录“本应驳回”的判定，不真正打断回答。
         dryRun: false
-        maxAttempts: 2
+        # 成本控制：最多打断一次；整个会话最多驳回 4 次；寒暄/短答不调审判。
+        maxAttempts: 1
+        sessionRejectBudget: 4
+        skipTrivial: true
         minAnswerChars: 40
         onJudgeError: allow
         skipSubagents: true
@@ -18,9 +21,9 @@
         # 留空 = 跟随当前会话的 provider/model；也可以指定更便宜/更强的审判模型。
         judgeProvider: ''
         judgeModel: ''
-        judgeMaxTokens: 6000
-        transcriptChars: 24000
-        toolResultChars: 1500
+        judgeMaxTokens: 3000
+        transcriptChars: 8000
+        toolResultChars: 1200
         submitTool: true
         promptOrder: 900
         contract: ''

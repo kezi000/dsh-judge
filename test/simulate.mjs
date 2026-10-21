@@ -54,10 +54,11 @@ function harness({ replies = [PASS], config = {}, messages = defaultMessages(), 
   apply(ctx, config);
 
   const steers = [];
+  let currentMessages = messages;
   const session = {
     id: 'sess-1',
     header,
-    deriveMessages: () => messages,
+    deriveMessages: () => currentMessages,
     requestHeader: () => ({ config: { provider: 'p', model: 'm' } }),
   };
   const agent = { id: 'sess-1', session, options: { provider: 'p', model: 'm' }, steer: (m) => steers.push(m) };
@@ -69,6 +70,9 @@ function harness({ replies = [PASS], config = {}, messages = defaultMessages(), 
     steers,
     agent,
     calls: () => calls,
+    setMessages: (next) => {
+      currentMessages = next;
+    },
     stop: (turn = 1) => handlers.get('agent/turn-stopping')({ agent, turn, signal: new AbortController().signal }),
     tool: () => registered.find((r) => r.kind === 'tool')?.def,
   };
@@ -138,7 +142,10 @@ test('maxAttempts 用尽后放行，不无限驳回', async () => {
   await h.stop(7);
   await h.stop(7);
   assert.equal(h.steers.length, 1);
-  assert.ok(h.logs.some((l) => String(l[1]).includes('budget exhausted')));
+  assert.ok(
+    h.logs.some((l) => String(l[1]).includes('unchanged') || String(l[1]).includes('budget exhausted')),
+    'should log why it stopped rejecting',
+  );
 });
 
 test('另一个 turn 重新计数', async () => {
@@ -157,6 +164,35 @@ test('短答案不审', async () => {
 
 test('子代理会话跳过', async () => {
   const h = harness({ replies: [REVISE], header: { origin: 'subagent', parentSession: 'parent' } });
+  await h.stop(1);
+  assert.equal(h.steers.length, 0);
+  assert.equal(h.calls(), 0);
+});
+
+test('驳回后模型原样重交：不再第二次驳回、不再调审判', async () => {
+  const h = harness({ replies: [REVISE], config: { maxAttempts: 2 } });
+  await h.stop(1);
+  const callsAfterFirst = h.calls();
+  await h.stop(1);
+  assert.equal(h.steers.length, 1, 'second unchanged draft must not steer');
+  assert.equal(h.calls(), callsAfterFirst, 'second identical draft must not be re-judged');
+  assert.ok(h.logs.some((l) => String(l[1]).includes('unchanged')), 'should log unchanged');
+});
+
+test('会话级驳回预算：超预算后只判定不打断', async () => {
+  const h = harness({ replies: [REVISE], config: { maxAttempts: 2, sessionRejectBudget: 1 } });
+  await h.stop(1);
+  assert.equal(h.steers.length, 1);
+  // 换一轮、换一份草稿，避免命中"原样重交"去重
+  const other = defaultMessages('另一份完全不同的答案：这里的版本号是 9.9.9，配置文件在 zzz.yml 的 plugins 段，改完需要重启一次才生效。');
+  h.setMessages(other);
+  await h.stop(2);
+  assert.equal(h.steers.length, 1, 'budget exhausted must not steer');
+  assert.ok(h.logs.some((l) => String(l[1]).includes('budget exhausted')), 'should log budget');
+});
+
+test('skipTrivial：纯确认不调审判', async () => {
+  const h = harness({ replies: [REVISE], config: { skipTrivial: true, minAnswerChars: 0 }, messages: defaultMessages('收到！') });
   await h.stop(1);
   assert.equal(h.steers.length, 0);
   assert.equal(h.calls(), 0);

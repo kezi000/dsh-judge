@@ -40,17 +40,21 @@ const DEFAULTS = {
   /** 审判模型路由；留空则沿用当前会话的 provider/model。 */
   judgeProvider: '',
   judgeModel: '',
-  judgeMaxTokens: 6000,
+  judgeMaxTokens: 3000,
   /** 送进审判员的转录总字符预算（保留最近的）。 */
-  transcriptChars: 14000,
+  transcriptChars: 8000,
   /** 单条工具结果最多保留多少字符。 */
-  toolResultChars: 1500,
+  toolResultChars: 1200,
   /** 是否注册 `judge_review` 工具，让模型在“写正文之前”先送审草稿。 */
   submitTool: true,
   /** 系统提示词段落在组装顺序里的位置（越大越靠后）。 */
   promptOrder: 900,
   /** 覆盖内置的审判员契约文本（留空用内置）。 */
   contract: '',
+  /** 整个会话最多驳回几次（跨轮累计）；超过后只判定不打断，避免复杂任务里反复拉扯。 */
+  sessionRejectBudget: 4,
+  /** 跳过寒暄/纯确认类答案（不调用审判模型）。 */
+  skipTrivial: true,
 };
 
 const JUDGE_POLICY = `你是 DeepSeek Harness 的「审判员」。你在主模型即将把答案交给用户之前，对这份答案做事实核查。你不与用户对话，只输出一个 JSON 判定。
@@ -74,7 +78,11 @@ const JUDGE_POLICY = `你是 DeepSeek Harness 的「审判员」。你在主模�
 或
 {"verdict":"revise","confidence":0.8,"issues":[{"claim":"原文断言","kind":"unsupported|contradicted|overreach|stale","why":"为什么不算被证据支持"}],"must_do":["可执行的最小修复动作，例如：用 web_fetch 打开 X 核实版本号；或删除该断言；或标注未核实"]}
 
-issues 最多 6 条，must_do 最多 4 条，且必须是最小必要动作；如果证据已经足够只是表述过强，must_do 写"把结论降级为不确定并说明依据"。`;
+issues 最多 3 条，must_do 最多 3 条，且必须是最小必要动作。
+成本约束（重要）：每驳回一次，主模型都要带着全部上下文重跑一步，代价远高于你这次调用。因此：
+- 只列会真正误导用户的断言；措辞不精确、措辞保守、明显常识都不要列。
+- must_do 优先写「把结论降级为不确定 / 删除该断言 / 标注未核实」，只有该事实是答案核心且缺失会导致用户做错决定时，才要求去补证据（那会额外触发工具往返）。
+- 如果问题只是"语气太确定"而不是"事实错误"，must_do 只写降级，不要要求重新查证。`;
 
 const CONTRACT_ZH = `[审判员模式 · dsh-judge]
 在你把答案交付给用户之前，会有一位「审判员」复核事实性断言。为了通过复核：
@@ -107,9 +115,15 @@ function normalizeConfig(config) {
   cfg.minAnswerChars = Math.max(0, Number(cfg.minAnswerChars) || 0);
   cfg.language = cfg.language === 'en' ? 'en' : 'zh';
   cfg.onJudgeError = cfg.onJudgeError === 'revise' ? 'revise' : 'allow';
+  cfg.sessionRejectBudget = Math.max(0, Number(cfg.sessionRejectBudget) || 0);
+  cfg.skipTrivial = cfg.skipTrivial !== false;
+  cfg.judgeMaxTokens = Math.max(500, Number(cfg.judgeMaxTokens) || DEFAULTS.judgeMaxTokens);
   cfg.contract = String(cfg.contract || '').trim() || (cfg.language === 'en' ? CONTRACT_EN : CONTRACT_ZH);
   return cfg;
 }
+
+/** 纯寒暄 / 纯确认：不值得为它调用审判模型。 */
+const TRIVIAL_ANSWER = /^(好的|收到|已完成|完成了|已处理|已发送|已更新|没问题|OK|Okay|Done|Sure)[。.!！,，\s]*$/i;
 
 /** 从一个内容块数组里取出纯文本。 */
 function blocksToText(blocks) {
@@ -322,6 +336,10 @@ export function apply(ctx, config) {
 
   /** `${sessionId}:${turn}` -> 已驳回次数 */
   const attempts = new Map();
+  /** `${sessionId}:${turn}` -> 上次被驳回的草稿（归一化后），用于识别"模型没改就重交" */
+  const lastRejected = new Map();
+  /** sessionId -> 本会话累计驳回次数（跨轮），用于成本上限 */
+  const sessionRejects = new Map();
   /** sessionId -> 已经通过 judge_review 的草稿文本 */
   const approvedDrafts = new Map();
 
@@ -356,6 +374,7 @@ export function apply(ctx, config) {
     const messages = agent?.session?.deriveMessages?.() ?? [];
     const draft = String(draftOverride ?? lastAssistantText(messages) ?? '').trim();
     if (!draft) return { ok: false, empty: true };
+    if (cfg.skipTrivial && TRIVIAL_ANSWER.test(draft)) return { ok: false, trivial: true };
     if (draft.length < cfg.minAnswerChars) return { ok: false, tooShort: true };
     if (signal?.aborted) return { ok: false, aborted: true };
     const route = resolveRoute(agent, cfg);
@@ -430,13 +449,21 @@ export function apply(ctx, config) {
         }
       }
 
+      // 驳回后模型没有改动就重交：直接放行，连审判调用都省掉。
+      const key = attemptKey(agent, turn);
+      const preDraft = String(lastAssistantText(agent.session.deriveMessages?.() ?? [])).trim();
+      if (preDraft && lastRejected.get(key) === normalizeDraft(preDraft)) {
+        log('warn', 'draft unchanged after rejection; skipping re-judge and letting it through', { turn });
+        attempts.set(key, cfg.maxAttempts);
+        return;
+      }
+
       const result = await review(agent, turn, signal);
       if (result.aborted) return;
       if (!result.ok) {
         if (result.error) {
           log('warn', 'judge call failed', { error: String(result.error?.message ?? result.error) });
           if (cfg.onJudgeError === 'revise') {
-            const key = attemptKey(agent, turn);
             const used = attempts.get(key) ?? 0;
             if (used < cfg.maxAttempts) {
               attempts.set(key, used + 1);
@@ -448,13 +475,32 @@ export function apply(ctx, config) {
       }
 
       const { verdict, draft } = result;
+      const normDraft = normalizeDraft(draft);
       if (verdict.verdict === 'pass') {
-        attempts.delete(attemptKey(agent, turn));
+        attempts.delete(key);
+        lastRejected.delete(key);
         log('info', 'answer passed', { turn, confidence: verdict.confidence });
         return;
       }
 
-      const key = attemptKey(agent, turn);
+      // 模型被驳回后没有实质性修改：不再重复驳回（每次驳回都是一次完整的主模型重跑）。
+      if (lastRejected.get(key) === normDraft) {
+        log('warn', 'draft unchanged after rejection; letting it through to avoid a loop', { turn });
+        attempts.set(key, cfg.maxAttempts);
+        return;
+      }
+
+      // 会话级驳回预算：复杂任务里防止一轮接一轮地烧 token。
+      if ((sessionRejects.get(sessionId) ?? 0) >= cfg.sessionRejectBudget) {
+        log('warn', 'session reject budget exhausted; judging only, not steering', {
+          turn,
+          budget: cfg.sessionRejectBudget,
+          issues: verdict.issues.map((i) => i.kind),
+        });
+        attempts.set(key, cfg.maxAttempts);
+        return;
+      }
+
       const used = attempts.get(key) ?? 0;
       if (used >= cfg.maxAttempts) {
         log('warn', 'answer still rejected but attempt budget exhausted; letting it through', {
@@ -478,6 +524,8 @@ export function apply(ctx, config) {
         return;
       }
 
+      sessionRejects.set(sessionId, (sessionRejects.get(sessionId) ?? 0) + 1);
+      lastRejected.set(key, normDraft);
       log('info', 'answer rejected; steering revision', { turn, attempt: used + 1, issues: verdict.issues.length });
       agent.steer(reviseMessage(verdict, used + 1));
     }),
@@ -541,7 +589,9 @@ export function apply(ctx, config) {
       const id = typeof sessionOrId === 'string' ? sessionOrId : String(sessionOrId?.id ?? '');
       if (!id) return;
       approvedDrafts.delete(id);
+      sessionRejects.delete(id);
       for (const key of [...attempts.keys()]) if (key.startsWith(`${id}:`)) attempts.delete(key);
+      for (const key of [...lastRejected.keys()]) if (key.startsWith(`${id}:`)) lastRejected.delete(key);
     }),
   );
 
@@ -549,5 +599,6 @@ export function apply(ctx, config) {
     dryRun: cfg.dryRun,
     maxAttempts: cfg.maxAttempts,
     submitTool: cfg.submitTool,
+    sessionRejectBudget: cfg.sessionRejectBudget,
   });
 }
