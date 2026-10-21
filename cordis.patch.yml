@@ -27,3 +27,17 @@
         submitTool: true
         promptOrder: 900
         contract: ''
+        # Jev（TypeSafe System One）廉价预筛：默认关闭。
+        # 打开后先用 Noul 概率判断"有无缺证据/矛盾的断言"，低风险直接放行、不调大模型审判。
+        # 本机直连 api.typesafe.ai 会返回 451（区域限制），需要走本地代理。
+        jev:
+          enabled: false
+          baseUrl: https://api.typesafe.ai
+          model: jev-latest
+          proxyUrl: http://127.0.0.1:10809
+          apiKeyEnv: TYPESAFE_API_KEY
+          apiKeyFile: C:/Users/XY/.typesafe/api-key.txt
+          stateChars: 4000
+          riskThreshold: 0.5
+          timeoutMs: 12000
+          onError: judge

@@ -17,6 +17,10 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
+import tls from 'node:tls';
 
 export const name = 'dsh-judge';
 
@@ -55,6 +59,27 @@ const DEFAULTS = {
   sessionRejectBudget: 4,
   /** 跳过寒暄/纯确认类答案（不调用审判模型）。 */
   skipTrivial: true,
+  /**
+   * Jev（TypeSafe System One）廉价预筛。开启后先用 Noul 概率判断"这份答案有没有
+   * 缺证据/自相矛盾的事实断言"：低风险直接放行、不调用大模型审判；高风险才升级。
+   * 默认关闭，先用真实数据校准 riskThreshold 再打开。
+   */
+  jev: {
+    enabled: false,
+    baseUrl: 'https://api.typesafe.ai',
+    model: 'jev-latest',
+    /** 空 = 直连；本机被区域限制时填本地代理，如 http://127.0.0.1:10809 */
+    proxyUrl: '',
+    apiKeyEnv: 'TYPESAFE_API_KEY',
+    apiKeyFile: 'C:/Users/XY/.typesafe/api-key.txt',
+    /** 送给 Jev 的 state 截断长度（字符）。 */
+    stateChars: 4000,
+    /** 风险概率 >= 该值才升级到大模型审判；Noul 0.5 表示是非各半。 */
+    riskThreshold: 0.5,
+    timeoutMs: 12000,
+    /** Jev 调用失败时：judge = 回退到大模型审判（默认）/ pass = 放行。 */
+    onError: 'judge',
+  },
 };
 
 const JUDGE_POLICY = `你是 DeepSeek Harness 的「审判员」。你在主模型即将把答案交给用户之前，对这份答案做事实核查。你不与用户对话，只输出一个 JSON 判定。
@@ -118,6 +143,16 @@ function normalizeConfig(config) {
   cfg.sessionRejectBudget = Math.max(0, Number(cfg.sessionRejectBudget) || 0);
   cfg.skipTrivial = cfg.skipTrivial !== false;
   cfg.judgeMaxTokens = Math.max(500, Number(cfg.judgeMaxTokens) || DEFAULTS.judgeMaxTokens);
+  const rawJev = config && typeof config === 'object' && config.jev && typeof config.jev === 'object' ? config.jev : {};
+  cfg.jev = { ...DEFAULTS.jev, ...rawJev };
+  cfg.jev.enabled = cfg.jev.enabled === true;
+  cfg.jev.stateChars = Math.max(1000, Number(cfg.jev.stateChars) || DEFAULTS.jev.stateChars);
+  cfg.jev.riskThreshold = Math.min(0.95, Math.max(0.05, Number(cfg.jev.riskThreshold) || DEFAULTS.jev.riskThreshold));
+  cfg.jev.timeoutMs = Math.max(1000, Number(cfg.jev.timeoutMs) || DEFAULTS.jev.timeoutMs);
+  cfg.jev.onError = cfg.jev.onError === 'pass' ? 'pass' : 'judge';
+  cfg.jev.proxyUrl = String(cfg.jev.proxyUrl || '').trim();
+  cfg.jev.model = String(cfg.jev.model || DEFAULTS.jev.model);
+  cfg.jev.baseUrl = String(cfg.jev.baseUrl || DEFAULTS.jev.baseUrl).replace(/\/+$/, '');
   cfg.contract = String(cfg.contract || '').trim() || (cfg.language === 'en' ? CONTRACT_EN : CONTRACT_ZH);
   return cfg;
 }
@@ -275,6 +310,146 @@ function resolveRoute(agent, cfg) {
   return { provider, model };
 }
 
+/* ---------------- Jev（TypeSafe System One）廉价预筛 ---------------- */
+
+let jevKeyCache = new Map();
+
+/** 取 TypeSafe key：先环境变量，再兜底文件；都没有就返回空串。 */
+function jevApiKey(cfg) {
+  const cacheKey = `${cfg.jev.apiKeyEnv}|${cfg.jev.apiKeyFile}`;
+  if (jevKeyCache.has(cacheKey)) return jevKeyCache.get(cacheKey);
+  const fromEnv = process.env[cfg.jev.apiKeyEnv];
+  if (fromEnv && fromEnv.trim()) {
+    jevKeyCache.set(cacheKey, fromEnv.trim());
+    return fromEnv.trim();
+  }
+  try {
+    const fromFile = readFileSync(cfg.jev.apiKeyFile, 'utf8').trim();
+    jevKeyCache.set(cacheKey, fromFile);
+    return fromFile;
+  } catch {
+    jevKeyCache.set(cacheKey, '');
+    return '';
+  }
+}
+
+/** 通过 HTTP CONNECT 代理发 HTTPS JSON（Node 自带模块，无第三方依赖）。 */
+function httpsJsonViaProxy(proxyUrl, url, payload, headers, timeoutMs) {
+  const proxy = new URL(proxyUrl);
+  const target = new URL(url);
+  const body = Buffer.from(JSON.stringify(payload), 'utf8');
+  return new Promise((resolve, reject) => {
+    const connectReq = http.request({
+      host: proxy.hostname,
+      port: Number(proxy.port) || 80,
+      method: 'CONNECT',
+      path: `${target.hostname}:443`,
+      headers: { host: `${target.hostname}:443` },
+      timeout: timeoutMs,
+    });
+    connectReq.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        reject(new Error(`proxy CONNECT ${res.statusCode}`));
+        return;
+      }
+      const tlsSocket = tls.connect({ socket, servername: target.hostname }, () => {
+        const agent = new https.Agent({ keepAlive: false });
+        agent.createConnection = () => tlsSocket;
+        const req = https.request(
+          {
+            host: target.hostname,
+            path: target.pathname + target.search,
+            method: 'POST',
+            agent,
+            headers: { ...headers, 'content-type': 'application/json', 'content-length': body.length },
+            timeout: timeoutMs,
+          },
+          (resp) => {
+            const chunks = [];
+            resp.on('data', (chunk) => chunks.push(chunk));
+            resp.on('end', () => resolve({ status: resp.statusCode, text: Buffer.concat(chunks).toString('utf8') }));
+          },
+        );
+        req.on('error', reject);
+        req.on('timeout', () => req.destroy(new Error('jev request timeout')));
+        req.end(body);
+      });
+      tlsSocket.on('error', reject);
+    });
+    connectReq.on('error', reject);
+    connectReq.on('timeout', () => connectReq.destroy(new Error('jev proxy timeout')));
+    connectReq.end();
+  });
+}
+
+/** 发一次 Jev 请求：有 proxyUrl 走 CONNECT 隧道，否则直连 fetch。 */
+async function jevRequest(cfg, key, body) {
+  const url = `${cfg.jev.baseUrl}/v1/systemone`;
+  const headers = { authorization: `Bearer ${key}` };
+  if (cfg.jev.proxyUrl) {
+    return httpsJsonViaProxy(cfg.jev.proxyUrl, url, body, headers, cfg.jev.timeoutMs);
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), cfg.jev.timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    return { status: res.status, text: await res.text() };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 用 Jev 做一次预筛：三个 Noul 问句，取最大概率作为"需要深审"的风险分。
+ * 成功返回 { ok:true, risk, probs, usage }；失败返回 { ok:false, reason }。
+ */
+async function jevScreen(cfg, transcript, draft) {
+  const key = jevApiKey(cfg);
+  if (!key) return { ok: false, reason: 'no-api-key' };
+  const state = `${clip(transcript, cfg.jev.stateChars)}\n\nDRAFT_ANSWER:\n${draft}`;
+  const body = {
+    model: cfg.jev.model,
+    state,
+    questions: {
+      unsupported: {
+        type: 'noul',
+        instructions: '答案包含至少一条具体事实性断言，而提供的会话工具结果不足以支持它。',
+        criteria: { true: '存在缺少证据支撑的具体断言', false: '断言都有工具结果支撑，或没有具体断言' },
+      },
+      contradicted: {
+        type: 'noul',
+        instructions: '答案与提供的会话工具结果矛盾。',
+        criteria: { true: '存在矛盾', false: '没有矛盾' },
+      },
+      overreach: {
+        type: 'noul',
+        instructions: '答案的结论强于提供的工具结果能支持的范围。',
+        criteria: { true: '结论超出证据', false: '结论与证据范围一致' },
+      },
+    },
+  };
+  const res = await jevRequest(cfg, key, body);
+  if (res.status !== 200) return { ok: false, reason: `http-${res.status}` };
+  let json;
+  try {
+    json = JSON.parse(res.text);
+  } catch {
+    return { ok: false, reason: 'bad-json' };
+  }
+  const probs = {};
+  for (const [name, answer] of Object.entries(json.answers ?? {})) {
+    if (typeof answer?.noul === 'number') probs[name] = answer.noul;
+  }
+  if (Object.keys(probs).length === 0) return { ok: false, reason: 'no-answers' };
+  return { ok: true, risk: Math.max(...Object.values(probs)), probs, usage: json.usage, model: json.model };
+}
+
 /** 调一次审判模型，返回结构化判定。 */
 async function callJudge(ctx, route, userText, signal, cfg, budget = cfg.judgeMaxTokens) {
   let text = '';
@@ -379,9 +554,35 @@ export function apply(ctx, config) {
     if (signal?.aborted) return { ok: false, aborted: true };
     const route = resolveRoute(agent, cfg);
     const transcript = renderTranscript(messages, cfg, draft);
+
+    let jevInfo;
+    if (cfg.jev.enabled) {
+      try {
+        const screen = await jevScreen(cfg, transcript, draft);
+        if (screen.ok) {
+          jevInfo = { risk: screen.risk, probs: screen.probs, usage: screen.usage, model: screen.model };
+          if (screen.risk < cfg.jev.riskThreshold) {
+            return {
+              ok: true,
+              verdict: { verdict: 'pass', confidence: Number((1 - screen.risk).toFixed(3)), issues: [], mustDo: [] },
+              draft,
+              jev: jevInfo,
+              skippedJudge: true,
+            };
+          }
+        } else if (cfg.jev.onError === 'pass') {
+          return { ok: true, verdict: { verdict: 'pass', confidence: 0, issues: [], mustDo: [] }, draft, jev: { error: screen.reason }, skippedJudge: true };
+        }
+      } catch (error) {
+        if (cfg.jev.onError === 'pass') {
+          return { ok: true, verdict: { verdict: 'pass', confidence: 0, issues: [], mustDo: [] }, draft, jev: { error: String(error?.message ?? error) }, skippedJudge: true };
+        }
+      }
+    }
+
     try {
       const verdict = await callJudge(ctx, route, judgeUserText(transcript, draft, cfg), signal, cfg);
-      return { ok: true, verdict, draft };
+      return { ok: true, verdict, draft, jev: jevInfo };
     } catch (error) {
       return { ok: false, error, draft };
     }
@@ -479,7 +680,11 @@ export function apply(ctx, config) {
       if (verdict.verdict === 'pass') {
         attempts.delete(key);
         lastRejected.delete(key);
-        log('info', 'answer passed', { turn, confidence: verdict.confidence });
+        log('info', result.skippedJudge ? 'answer passed by jev pre-screen' : 'answer passed', {
+          turn,
+          confidence: verdict.confidence,
+          ...(result.jev ? { jev: result.jev.risk !== undefined ? { risk: result.jev.risk, usage: result.jev.usage } : { error: result.jev.error } } : {}),
+        });
         return;
       }
 

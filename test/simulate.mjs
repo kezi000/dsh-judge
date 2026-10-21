@@ -198,6 +198,82 @@ test('skipTrivial：纯确认不调审判', async () => {
   assert.equal(h.calls(), 0);
 });
 
+/* ---------------- Jev 预筛（stub 掉 global fetch，不联网） ---------------- */
+
+function jevConfig(overrides = {}) {
+  return {
+    jev: {
+      enabled: true,
+      proxyUrl: '',
+      apiKeyEnv: 'DSH_JUDGE_TEST_KEY',
+      apiKeyFile: 'C:/definitely-not-here/api-key.txt',
+      riskThreshold: 0.5,
+      ...overrides,
+    },
+  };
+}
+
+function stubJev(noul, { fail = false } = {}) {
+  globalThis.fetch = async () => {
+    if (fail) throw new Error('network down');
+    return {
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          model: 'jev-test',
+          answers: { unsupported: { type: 'noul', noul }, contradicted: { type: 'noul', noul: 0.1 }, overreach: { type: 'noul', noul: 0.2 } },
+          usage: { input_tokens: 500, output_tokens: 40 },
+        }),
+    };
+  };
+}
+
+test('Jev 低风险 → 直接放行，不调大模型审判', async () => {
+  process.env.DSH_JUDGE_TEST_KEY = 'test-key';
+  stubJev(0.12);
+  const h = harness({ replies: [REVISE], config: jevConfig() });
+  await h.stop(1);
+  assert.equal(h.steers.length, 0);
+  assert.equal(h.calls(), 0, 'jev pass must skip the LLM judge');
+  assert.ok(h.logs.some((l) => String(l[1]).includes('jev pre-screen')), 'should log jev pass');
+});
+
+test('Jev 高风险 → 升级到大模型审判', async () => {
+  process.env.DSH_JUDGE_TEST_KEY = 'test-key';
+  stubJev(0.9);
+  const h = harness({ replies: [PASS], config: jevConfig() });
+  await h.stop(1);
+  assert.equal(h.calls(), 1, 'high risk must escalate');
+  assert.equal(h.steers.length, 0);
+});
+
+test('Jev 调用失败 → 默认回退大模型审判', async () => {
+  process.env.DSH_JUDGE_TEST_KEY = 'test-key';
+  stubJev(0, { fail: true });
+  const h = harness({ replies: [PASS], config: jevConfig() });
+  await h.stop(1);
+  assert.equal(h.calls(), 1, 'error must fall back to the judge');
+});
+
+test('Jev 调用失败 + onError=pass → 放行', async () => {
+  process.env.DSH_JUDGE_TEST_KEY = 'test-key';
+  stubJev(0, { fail: true });
+  const h = harness({ replies: [PASS], config: jevConfig({ onError: 'pass' }) });
+  await h.stop(1);
+  assert.equal(h.calls(), 0);
+  assert.equal(h.steers.length, 0);
+});
+
+test('Jev 没有 key → 回退大模型审判', async () => {
+  delete process.env.DSH_JUDGE_TEST_KEY;
+  const h = harness({
+    replies: [PASS],
+    config: { jev: { enabled: true, proxyUrl: '', apiKeyEnv: 'DSH_JUDGE_TEST_KEY_NONE', apiKeyFile: 'C:/definitely-not-here/x.txt' } },
+  });
+  await h.stop(1);
+  assert.equal(h.calls(), 1);
+});
+
 test('系统提示词段落已注册', async () => {
   const h = harness({});
   const section = h.registered.find((r) => r.kind === 'section');

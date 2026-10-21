@@ -117,6 +117,9 @@ settlement 时已提交到 surface），插件**无法撤回**已经流出的文
 | `submitTool` | `true` | 是否注册 `judge_review` 工具 |
 | `promptOrder` | `900` | 系统提示词段落位置 |
 | `contract` | 空 | 覆盖内置「审判员模式」契约文本 |
+| `jev.enabled` | `false` | 是否先用 Jev 做廉价预筛（见 §6.1） |
+| `jev.riskThreshold` | `0.5` | Jev 风险概率 ≥ 该值才升级到大模型审判 |
+| `jev.proxyUrl` | 空 | Jev 直连被区域限制时需要本地代理，例如 `http://127.0.0.1:10809` |
 
 ## 6. 成本控制与调参建议
 
@@ -134,6 +137,29 @@ settlement 时已提交到 surface），插件**无法撤回**已经流出的文
 7. **审判模型**：默认跟随主模型；改成更便宜的小模型通常更省，但同源盲区需要自己评估。
 8. **`dryRun: true`**：只判定不打断——复杂任务里先观察几天再开启拦截。
 9. **`maxAttempts: 0`**：等价于"只看不拦"，适合完全不想付主模型重跑成本的场景。
+
+### 6.1 可选：Jev（TypeSafe）廉价预筛
+
+Jev 是 TypeSafe 的 System One 模型：输入 state + 若干 Noul（是/否）问题，返回**概率**而不生成文本，
+单次调用毫秒级、单价远低于推理模型。用法是两级过滤：
+
+1. 先用 Jev 问三条：`存在缺证据的具体断言？`、`与工具结果矛盾？`、`结论超出证据范围？`；
+2. 三条概率的最大值 < `jev.riskThreshold` → **直接放行**，不调用大模型审判；
+3. 否则升级到原来的大模型审判，由它产出 `issues` / `must_do` 的驳回理由。
+
+Jev 不给驳回文案，所以它不能单独承担"驳回并说明原因"，只适合做放行闸门。
+
+本机实测（2026-10-21）：
+
+| 项目 | 结果 |
+|---|---|
+| 直连 `POST https://api.typesafe.ai/v1/systemone` | **HTTP 451** `Typesafe is not available in your region.` |
+| 走本地代理 `127.0.0.1:10809` | **HTTP 200**，`model: jev-1.13.0` |
+| 样例判定（草稿写了未核实的版本号） | `unsupported = 0.96`、`contradicted = 0.28` ✅ |
+| 用量 | 496 input / 39 output tokens，约 1.1s（另一条 369 / 20，约 1.07s） |
+
+所以启用前要先准备：`TYPESAFE_API_KEY`（或 `apiKeyFile` 指向的 key 文件）+ 一个能出海的本地代理。
+阈值 0.5 只是起点（Noul 0.5 = 是非各半），请用一批真实答案 + 标签跑 sweep 再定。
 
 ## 7. 验证
 
